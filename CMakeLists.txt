@@ -92,6 +92,8 @@ add_library( MapForGoblins SHARED
   ${GEN_DIR}/goblin_geof_models.cpp
   src/goblin_config_schema.hpp
   src/goblin_config_schema.cpp
+  src/goblin_i18n.hpp
+  src/goblin_i18n.cpp
   src/goblin_config.hpp
   src/goblin_config.cpp
   src/goblin_collected.hpp
@@ -143,7 +145,7 @@ target_compile_definitions(MapForGoblins PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPA
 # header, which changes the bytes every build and lets a borderline AV ML model
 # (Wacatac.B!ml) flip its verdict between otherwise-identical builds. Stable bytes
 # => stable verdict (and a clean variant stays clean).
-target_compile_options(MapForGoblins PRIVATE /Brepro)
+target_compile_options(MapForGoblins PRIVATE /Brepro /utf-8)
 target_link_options(MapForGoblins PRIVATE /Brepro)
 
 # Non-ERR bakes (vanilla, convergence): omit + disable ERR-only config
@@ -162,8 +164,9 @@ endif()
 # Tiny build-time tool that emits the default ini from the in-code schema
 # (src/goblin_config_schema.cpp). build.bat runs it to generate the shipped
 # ini per profile instead of copying a hand-maintained file.
-add_executable(mfg_inigen src/inigen_main.cpp src/goblin_config_schema.cpp)
+add_executable(mfg_inigen src/inigen_main.cpp src/goblin_config_schema.cpp src/goblin_i18n.cpp)
 target_include_directories(mfg_inigen PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_options(mfg_inigen PRIVATE /utf-8)
 # Keep the generated ini's defaults in sync with the DLL's compiled defaults.
 if(GENERATED_SUBDIR STREQUAL "generated_vanilla")
   target_compile_definitions(mfg_inigen PRIVATE MFG_PROFILE_VANILLA=1)

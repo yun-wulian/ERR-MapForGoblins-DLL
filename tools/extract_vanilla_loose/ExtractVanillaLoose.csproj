@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RollForward>LatestMajor</RollForward>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Andre.SoulsFormats">
+      <HintPath>..\lib\Andre.SoulsFormats.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="BouncyCastle.Cryptography">
+      <HintPath>..\lib\BouncyCastle.Cryptography.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="CommunityToolkit.HighPerformance">
+      <HintPath>..\lib\CommunityToolkit.HighPerformance.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="DotNext">
+      <HintPath>..\lib\DotNext.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="DotNext.Unsafe">
+      <HintPath>..\lib\DotNext.Unsafe.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="DrSwizzler">
+      <HintPath>..\lib\DrSwizzler.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="ZstdNet">
+      <HintPath>..\lib\ZstdNet.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

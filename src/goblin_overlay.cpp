@@ -24,6 +24,7 @@
 #include "goblin_overlay.hpp"
 #include "goblin_config.hpp"
 #include "goblin_config_schema.hpp"
+#include "goblin_i18n.hpp"
 #include "goblin_overlay_icons.hpp"
 #include "goblin_inject.hpp"
 #include "goblin_markers.hpp"
@@ -66,10 +67,12 @@ ExecuteCommandLists_t oExecuteCommandLists = nullptr;
 GetRawInputData_t oGetRawInputData = nullptr;
 XInputGetState_t oXInputGetState = nullptr;
 
-// Captured controller-0 state for ImGui gamepad nav (the game's read is zeroed
-// while the menu is open; we feed ImGui from this real snapshot instead).
+// Captured active-controller state for ImGui gamepad nav and overlay hotkeys.
+// The game may read only controller slot 0, so hkPresent also refreshes this from
+// every XInput slot before it evaluates menu inputs.
 XINPUT_GAMEPAD g_pad{};
 bool g_pad_ok = false;
+DWORD g_pad_index = 0;
 
 // Raw-input capture (ER reads kbd/mouse via raw input, not legacy WM_* msgs).
 // The hook runs on the game's message thread; it only writes these atomics, and
@@ -124,7 +127,7 @@ std::atomic<bool> g_menu_open{false};
 // Buttons held at the moment the overlay closed (e.g. B used to close it). We
 // keep suppressing them in the game's XInput read until released, so the closing
 // press does not fall through into gameplay.
-std::atomic<WORD> g_pad_swallow{0};
+std::atomic<WORD> g_pad_swallow[XUSER_MAX_COUNT]{};
 bool g_context_inited = false; // ImGui context + win32 backend + wndproc detour
 bool g_dx12_inited = false;    // DX12 device objects + ImGui dx12 backend
 std::vector<char> g_dump_buf;       // Tools tab: last marker-dump text (copyable)
@@ -240,6 +243,125 @@ std::string fmt_gamepad(uint16_t m)
     return s.empty() ? "(none)" : s;
 }
 
+constexpr int PAD_ACTIVITY_DEADZONE = 12000;
+
+bool pad_has_activity(const XINPUT_GAMEPAD &pad)
+{
+    return pad.wButtons != 0 ||
+           pad.sThumbLX > PAD_ACTIVITY_DEADZONE || pad.sThumbLX < -PAD_ACTIVITY_DEADZONE ||
+           pad.sThumbLY > PAD_ACTIVITY_DEADZONE || pad.sThumbLY < -PAD_ACTIVITY_DEADZONE ||
+           pad.sThumbRX > PAD_ACTIVITY_DEADZONE || pad.sThumbRX < -PAD_ACTIVITY_DEADZONE ||
+           pad.sThumbRY > PAD_ACTIVITY_DEADZONE || pad.sThumbRY < -PAD_ACTIVITY_DEADZONE ||
+           pad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ||
+           pad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
+}
+
+bool pad_has_mask(const XINPUT_GAMEPAD &pad, uint16_t mask)
+{
+    return mask != 0 && (pad.wButtons & mask) == mask;
+}
+
+void set_active_gamepad(DWORD idx, const XINPUT_GAMEPAD &pad)
+{
+    g_pad = pad;
+    g_pad_ok = true;
+    g_pad_index = idx;
+}
+
+void refresh_gamepad_state()
+{
+    if (!oXInputGetState)
+        return;
+
+    const uint16_t toggle_mask = goblin::config::toggleGamepadMask;
+    const bool menu_open = g_menu_open.load();
+    bool have_first = false, have_current = false, have_active = false;
+    bool have_close = false, have_combo = false;
+    XINPUT_GAMEPAD first{}, current{}, active{}, close_pad{}, combo{};
+    DWORD first_idx = 0, current_idx = 0, active_idx = 0, close_idx = 0, combo_idx = 0;
+
+    for (DWORD idx = 0; idx < XUSER_MAX_COUNT; ++idx)
+    {
+        XINPUT_STATE state{};
+        if (oXInputGetState(idx, &state) != ERROR_SUCCESS)
+            continue;
+
+        const XINPUT_GAMEPAD &pad = state.Gamepad;
+        if (!have_first)
+        {
+            first = pad;
+            first_idx = idx;
+            have_first = true;
+        }
+        if (idx == g_pad_index)
+        {
+            current = pad;
+            current_idx = idx;
+            have_current = true;
+        }
+        if (!have_active && pad_has_activity(pad))
+        {
+            active = pad;
+            active_idx = idx;
+            have_active = true;
+        }
+        if (menu_open && (pad.wButtons & XINPUT_GAMEPAD_B))
+        {
+            close_pad = pad;
+            close_idx = idx;
+            have_close = true;
+        }
+        if (pad_has_mask(pad, toggle_mask))
+        {
+            combo = pad;
+            combo_idx = idx;
+            have_combo = true;
+            break;
+        }
+    }
+
+    if (have_combo)
+        set_active_gamepad(combo_idx, combo);
+    else if (have_close)
+        set_active_gamepad(close_idx, close_pad);
+    else if (have_active)
+        set_active_gamepad(active_idx, active);
+    else if (have_current)
+        set_active_gamepad(current_idx, current);
+    else if (have_first)
+        set_active_gamepad(first_idx, first);
+    else
+        g_pad_ok = false;
+}
+
+void capture_swallow_buttons()
+{
+    for (DWORD idx = 0; idx < XUSER_MAX_COUNT; ++idx)
+    {
+        WORD held = 0;
+        if (oXInputGetState)
+        {
+            XINPUT_STATE state{};
+            if (oXInputGetState(idx, &state) == ERROR_SUCCESS)
+                held = state.Gamepad.wButtons;
+        }
+        else if (g_pad_ok && idx == g_pad_index)
+        {
+            held = g_pad.wButtons;
+        }
+        g_pad_swallow[idx].store(held);
+    }
+}
+
+void reset_rebind_state()
+{
+    g_rebind_mode.store(0);
+    g_rebind_target = nullptr;
+    g_captured_vk.store(0);
+    g_captured_up.store(false);
+    g_rebind_pad_accum = 0;
+}
+
 // Apply an in-progress hotkey rebind (render thread). Esc cancels. A keyboard key
 // commits immediately; a gamepad combo commits once all buttons are released.
 void process_rebind()
@@ -249,9 +371,7 @@ void process_rebind()
         return;
     if (g_captured_vk.load() == VK_ESCAPE) // cancel immediately
     {
-        g_rebind_mode.store(0);
-        g_captured_vk.store(0);
-        g_captured_up.store(false);
+        reset_rebind_state();
         return;
     }
     if (mode == 1) // keyboard key - commit on RELEASE so the bind press doesn't
@@ -260,9 +380,7 @@ void process_rebind()
         if (vk != 0 && g_captured_up.load())
         {
             *static_cast<uint32_t *>(g_rebind_target) = vk;
-            g_rebind_mode.store(0);
-            g_captured_vk.store(0);
-            g_captured_up.store(false);
+            reset_rebind_state();
         }
     }
     else // mode 2: gamepad combo - accumulate held buttons, commit on release
@@ -273,7 +391,7 @@ void process_rebind()
         else if (g_rebind_pad_accum)
         {
             *static_cast<uint16_t *>(g_rebind_target) = g_rebind_pad_accum;
-            g_rebind_mode.store(0);
+            reset_rebind_state();
         }
     }
 }
@@ -283,6 +401,9 @@ void process_rebind()
 // entry (checkbox / slider / hotkey rebind). Sets `changed` on any edit.
 void draw_section(const goblin::IniSection &sec, bool &changed)
 {
+    namespace tr = goblin::i18n;
+    const tr::Language lang = tr::current_language();
+
     ImGui::PushID(sec.name);
     // Group toggles: flip every Bool in this section at once.
     auto set_section = [&](bool v) {
@@ -295,24 +416,24 @@ void draw_section(const goblin::IniSection &sec, bool &changed)
     // AllowOverlap so the "all on"/"all off" buttons drawn on top of the
     // header row capture the click instead of the header toggling the fold.
     const bool open = ImGui::CollapsingHeader(
-        sec.name, ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
+        tr::section_label(sec.name, lang), ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
     // "all on"/"all off" right-aligned on the header row (work even when collapsed).
     const ImGuiStyle &st = ImGui::GetStyle();
-    const float w_on  = ImGui::CalcTextSize("all on").x + st.FramePadding.x * 2;
-    const float w_off = ImGui::CalcTextSize("all off").x + st.FramePadding.x * 2;
+    const char *all_on = tr::tr(tr::TextId::AllOn, lang);
+    const char *all_off = tr::tr(tr::TextId::AllOff, lang);
+    const float w_on  = ImGui::CalcTextSize(all_on).x + st.FramePadding.x * 2;
+    const float w_off = ImGui::CalcTextSize(all_off).x + st.FramePadding.x * 2;
     ImGui::SameLine(ImGui::GetContentRegionMax().x - w_on - w_off - st.ItemSpacing.x);
-    if (ImGui::SmallButton("all on")) set_section(true);
+    if (ImGui::SmallButton(all_on)) set_section(true);
     ImGui::SameLine();
-    if (ImGui::SmallButton("all off")) set_section(false);
+    if (ImGui::SmallButton(all_off)) set_section(false);
     ImGui::PopID();
     if (!open)
         return;
     if (std::strcmp(sec.name, "Compatibility") == 0)
     {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.82f, 1.0f, 1.0f));
-        ImGui::TextWrapped("Using a Randomizer? Enable live_loot_flags + "
-                           "live_loot_labels + live_loot_icons so markers match "
-                           "the shuffled item placements.");
+        ImGui::TextWrapped("%s", tr::tr(tr::TextId::RandomizerHint, lang));
         ImGui::PopStyleColor();
     }
     {
@@ -324,11 +445,11 @@ void draw_section(const goblin::IniSection &sec, bool &changed)
             if (std::strcmp(e.key, "fast_map_open") == 0)
             {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.84f, 0.0f, 1.0f)); // yellow
-                ImGui::TextWrapped("BETA: makes the map open faster. If the map glitches "
-                                   "or crashes, turn this off.");
+                ImGui::TextWrapped("%s", tr::tr(tr::TextId::FastMapOpenWarning, lang));
                 ImGui::PopStyleColor();
             }
             draw_row_icon(e.key);
+            const char *label = tr::entry_label(e.key, lang);
             bool hovered = false; // mouse hover OR keyboard/gamepad nav focus on this row
             if (e.type == goblin::IniType::Bool)
             {
@@ -342,23 +463,53 @@ void draw_section(const goblin::IniSection &sec, bool &changed)
                 bool v = *static_cast<bool *>(e.target);
                 if (locked)
                     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-                const bool clicked = ImGui::Checkbox(e.key, &v);
+                const bool clicked = ImGui::Checkbox(label, &v);
                 hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip);
                 if (locked) ImGui::PopStyleColor();
                 if (clicked && !locked) { *static_cast<bool *>(e.target) = v; changed = true; }
                 if (locked)
                 {
                     ImGui::SameLine();
-                    ImGui::TextDisabled("(.ini only)");
+                    ImGui::TextDisabled("%s", tr::tr(tr::TextId::IniOnly, lang));
                     hovered = hovered || ImGui::IsItemHovered();
                 }
             }
             else if (e.type == goblin::IniType::U8)
             {
                 int v = *static_cast<uint8_t *>(e.target);
-                if (ImGui::SliderInt(e.key, &v, 0, 30))
+                if (ImGui::SliderInt(label, &v, 0, 30))
+                {
                     *static_cast<uint8_t *>(e.target) =
                         static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+                    changed = true;
+                }
+                hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip);
+            }
+            else if (e.type == goblin::IniType::String)
+            {
+                std::string &value = *static_cast<std::string *>(e.target);
+                const char *preview = tr::language_preview_label(value, lang);
+                if (ImGui::BeginCombo(label, preview))
+                {
+                    const char *options[] = {"auto", "english", "schinese", "tchinese"};
+                    const std::string normalized = tr::normalize_language_config(value);
+                    const std::string selected_language = normalized == "auto"
+                        ? tr::language_code(tr::current_language())
+                        : normalized;
+                    for (const char *opt : options)
+                    {
+                        const bool selected = selected_language == opt &&
+                            !(normalized == "auto" && std::strcmp(opt, "auto") == 0);
+                        if (ImGui::Selectable(tr::language_option_label(opt, lang), selected))
+                        {
+                            value = opt;
+                            changed = true;
+                        }
+                        if (selected)
+                            ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
                 hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip);
             }
             else // VkKey / GamepadMask: show value + in-place rebind
@@ -368,17 +519,18 @@ void draw_section(const goblin::IniSection &sec, bool &changed)
                     is_key ? fmt_vk(*static_cast<uint32_t *>(e.target))
                            : fmt_gamepad(*static_cast<uint16_t *>(e.target));
                 const bool capturing = g_rebind_mode.load() != 0 && g_rebind_target == e.target;
-                char label[160];
-                std::snprintf(label, sizeof label, "%s = %s", e.key, val.c_str());
-                const float btn_w = 80.0f;
-                ImGui::Selectable(label, false, 0,
+                char label_buf[192];
+                std::snprintf(label_buf, sizeof label_buf, "%s = %s", label, val.c_str());
+                const float btn_w = 96.0f;
+                ImGui::Selectable(label_buf, false, 0,
                                   ImVec2(ImGui::GetContentRegionAvail().x - btn_w, 0));
                 hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip);
                 ImGui::SameLine();
                 if (capturing)
-                    ImGui::TextColored(ImVec4(1.0f, 0.84f, 0.38f, 1.0f),
-                                       is_key ? "press a key" : "press combo, release");
-                else if (ImGui::SmallButton("rebind"))
+                    ImGui::TextColored(ImVec4(1.0f, 0.84f, 0.38f, 1.0f), "%s",
+                                       is_key ? tr::tr(tr::TextId::PressAKey, lang)
+                                              : tr::tr(tr::TextId::PressComboRelease, lang));
+                else if (ImGui::SmallButton(tr::entry_label("rebind", lang)))
                 {
                     g_rebind_target = e.target;
                     g_rebind_pad_accum = 0;
@@ -388,19 +540,23 @@ void draw_section(const goblin::IniSection &sec, bool &changed)
                 }
             }
             if (e.comment && hovered)
-                ImGui::SetTooltip("%s", e.comment);
+                ImGui::SetTooltip("%s", tr::entry_comment(e.key, e.comment, lang));
             ImGui::PopID();
         }
     }
 }
 
+
 void draw_settings_tab()
 {
+    namespace tr = goblin::i18n;
+    const tr::Language lang = tr::current_language();
+
     // Blink yellow <-> red every 0.5s so it's hard to miss.
     const bool blink_red = (static_cast<int>(ImGui::GetTime() * 2.0) & 1) != 0;
     ImGui::PushStyleColor(ImGuiCol_Text, blink_red ? ImVec4(1.0f, 0.27f, 0.22f, 1.0f)
                                                    : ImVec4(1.0f, 0.84f, 0.38f, 1.0f));
-    ImGui::TextWrapped("You MUST re-open the world map to see changes!");
+    ImGui::TextWrapped("%s", tr::tr(tr::TextId::ReopenMapWarning, lang));
     ImGui::PopStyleColor();
     ImGui::Separator();
 
@@ -415,11 +571,11 @@ void draw_settings_tab()
                     *static_cast<bool *>(e.target) = v;
         changed = true;
     };
-    ImGui::TextUnformatted("All icon categories:");
+    ImGui::TextUnformatted(tr::tr(tr::TextId::AllIconCategories, lang));
     ImGui::SameLine();
-    if (ImGui::SmallButton("show all")) set_all_show(true);
+    if (ImGui::SmallButton(tr::tr(tr::TextId::ShowAll, lang))) set_all_show(true);
     ImGui::SameLine();
-    if (ImGui::SmallButton("hide all")) set_all_show(false);
+    if (ImGui::SmallButton(tr::tr(tr::TextId::HideAll, lang))) set_all_show(false);
     ImGui::Separator();
 
     // NavFlattened: keyboard/gamepad nav flows through this scroll region as if it
@@ -444,6 +600,9 @@ void draw_settings_tab()
 // ── Debug tab: diagnostics (debug_logging + marker-dump settings) + dump tool ──
 void draw_debug_tab()
 {
+    namespace tr = goblin::i18n;
+    const tr::Language lang = tr::current_language();
+
     bool changed = false;
     for (const auto &sec : goblin::ini_schema())
         if (std::strcmp(sec.name, "Debug") == 0)
@@ -452,20 +611,19 @@ void draw_debug_tab()
         goblin::reapply_live_settings();
     ImGui::Separator();
 
-    ImGui::TextWrapped("Dumps the map beacons (your 1-5 placed markers) and stamps "
-                       "to text. Works whether the map is open or closed. Press Copy "
-                       "to put it on the clipboard.");
-    if (ImGui::Button("Dump markers now"))
+    ImGui::TextWrapped("%s", tr::tr(tr::TextId::DebugDumpDescription, lang));
+    if (ImGui::Button(tr::tr(tr::TextId::DumpMarkersNow, lang)))
     {
         std::string s = goblin::markers::dump_to_string();
         g_dump_buf.assign(s.begin(), s.end());
         g_dump_buf.push_back('\0');
     }
     ImGui::SameLine();
-    if (ImGui::Button("Copy") && !g_dump_buf.empty())
+    if (ImGui::Button(tr::tr(tr::TextId::Copy, lang)) && !g_dump_buf.empty())
         ImGui::SetClipboardText(g_dump_buf.data()); // copies the whole dump
     ImGui::SameLine();
-    ImGui::TextDisabled("%d chars", g_dump_buf.empty() ? 0 : static_cast<int>(g_dump_buf.size() - 1));
+    ImGui::TextDisabled("%d %s", g_dump_buf.empty() ? 0 : static_cast<int>(g_dump_buf.size() - 1),
+                        tr::tr(tr::TextId::Chars, lang));
     ImGui::Separator();
     if (!g_dump_buf.empty())
     {
@@ -475,12 +633,16 @@ void draw_debug_tab()
         ImGui::EndChild();
     }
     else
-        ImGui::TextDisabled("(no dump yet - press the button above)");
+        ImGui::TextDisabled("%s", tr::tr(tr::TextId::NoDumpYet, lang));
+
 }
 
 // ── About tab: version + links ──
 void draw_about_tab()
 {
+    namespace tr = goblin::i18n;
+    const tr::Language lang = tr::current_language();
+
     // Large logo on the left, title/version/description to its right.
     if (g_atlas_ready && goblin::overlay_icons::LOGO_W > 0 && g_logo_gpu.ptr)
     {
@@ -493,24 +655,25 @@ void draw_about_tab()
     }
     ImGui::BeginGroup();
     ImGui::TextColored(ImVec4(0.80f, 0.68f, 0.40f, 1.0f), "Map for Goblins - DLL");
-    ImGui::Text("Version %s", PROJECT_VERSION);
+    ImGui::Text("%s %s", tr::tr(tr::TextId::Version, lang), PROJECT_VERSION);
     ImGui::Spacing();
-    ImGui::TextWrapped("Thousands of loot and world icons on the in-game map.");
+    ImGui::TextWrapped("%s", tr::tr(tr::TextId::AboutDescription, lang));
     ImGui::EndGroup();
     ImGui::Spacing();
     ImGui::Separator();
-    struct Link { const char *label; const char *url; const char *btn; };
+    struct Link { tr::TextId label; const char *url; const char *btn; };
     static const Link links[] = {
-        {"Nexus Mods",        "https://www.nexusmods.com/eldenring/mods/10062",     "copy##nx"},
-        {"GitHub (source)",   "https://github.com/VirusAlex/ERR-MapForGoblins-DLL", "copy##gh"},
-        {"Discord (support)", "https://discord.gg/JvTMwPCygB",                      "copy##dc"},
+        {tr::TextId::LinkNexus,   "https://www.nexusmods.com/eldenring/mods/10062",     "##nx"},
+        {tr::TextId::LinkGithub,  "https://github.com/VirusAlex/ERR-MapForGoblins-DLL", "##gh"},
+        {tr::TextId::LinkDiscord, "https://discord.gg/JvTMwPCygB",                      "##dc"},
     };
     for (const auto &l : links)
     {
-        ImGui::TextDisabled("%s:", l.label);
+        ImGui::TextDisabled("%s:", tr::tr(l.label, lang));
         ImGui::TextUnformatted(l.url);
         ImGui::SameLine();
-        if (ImGui::SmallButton(l.btn))
+        std::string copy_label = std::string(tr::tr(tr::TextId::Copy, lang)) + l.btn;
+        if (ImGui::SmallButton(copy_label.c_str()))
             ImGui::SetClipboardText(l.url);
     }
 }
@@ -518,18 +681,25 @@ void draw_about_tab()
 // ── Bottom-of-window control hints, auto-switched by the last input device ──
 void draw_control_hints()
 {
+    namespace tr = goblin::i18n;
+    const tr::Language lang = tr::current_language();
+
     ImGui::Separator();
     if (g_last_input.load() == 1)
-        ImGui::TextDisabled("D-Pad/Stick: move   A: toggle   B: close   LB/RB: switch tab");
+        ImGui::TextDisabled("%s", tr::tr(tr::TextId::ControlHintGamepad, lang));
     else
-        ImGui::TextDisabled("Mouse + Arrows: move   Click/Space: toggle   Esc: close");
+        ImGui::TextDisabled("%s", tr::tr(tr::TextId::ControlHintKeyboard, lang));
+
 }
 
 // ── The overlay window: master switch + tabs ──
 void draw_settings_window()
 {
+    namespace tr = goblin::i18n;
+    const tr::Language lang = tr::current_language();
+
     ImGui::SetNextWindowSize(ImVec2(560, 680), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Map for Goblins - Settings", nullptr))
+    if (!ImGui::Begin(tr::tr(tr::TextId::WindowTitle, lang), nullptr))
     {
         ImGui::End();
         return;
@@ -538,17 +708,15 @@ void draw_settings_window()
     // Master on/off for ALL icons. Settings auto-save on close and auto-reload on
     // open, so no Save/Reload buttons are needed.
     bool show_icons = !goblin::icons_hidden();
-    if (ImGui::Checkbox("Show map icons (master)", &show_icons))
+    if (ImGui::Checkbox(tr::tr(tr::TextId::MasterToggle, lang), &show_icons))
         goblin::set_icons_hidden(!show_icons);
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-        ImGui::SetTooltip("Turns ALL map icons on/off at once.\nWhen the overlay is "
-                          "disabled, toggle_key / the gamepad combo do this from "
-                          "outside the menu.");
+        ImGui::SetTooltip("%s", tr::tr(tr::TextId::MasterToggleTooltip, lang));
     // Right-aligned Close button.
     constexpr float close_w = 90.0f;
     ImGui::SameLine();
     ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - close_w);
-    if (ImGui::Button("Close", ImVec2(close_w, 0)))
+    if (ImGui::Button(tr::tr(tr::TextId::Close, lang), ImVec2(close_w, 0)))
         g_menu_open.store(false);
     ImGui::Separator();
 
@@ -576,9 +744,10 @@ void draw_settings_window()
     ImGui::BeginChild("##body", ImVec2(0, -footer_h), ImGuiChildFlags_NavFlattened);
     if (ImGui::BeginTabBar("##tabs"))
     {
-        if (ImGui::BeginTabItem("Settings", nullptr, tab_flag(0))) { draw_settings_tab(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Debug",    nullptr, tab_flag(1))) { draw_debug_tab();    ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("About",    nullptr, tab_flag(2))) { draw_about_tab();    ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(tr::tr(tr::TextId::TabSettings, lang), nullptr, tab_flag(0))) { draw_settings_tab(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(tr::tr(tr::TextId::TabDebug, lang),    nullptr, tab_flag(1))) { draw_debug_tab();    ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem(tr::tr(tr::TextId::TabAbout, lang),    nullptr, tab_flag(2))) { draw_about_tab();    ImGui::EndTabItem(); }
+
         ImGui::EndTabBar();
     }
     ImGui::EndChild();
@@ -719,27 +888,32 @@ UINT WINAPI hkGetRawInputData(HRAWINPUT hri, UINT cmd, LPVOID data, PUINT size, 
     return res;
 }
 
-// XInput gate: always snapshot controller-0 (so hkPresent can read the open/close
-// combo even while the menu is CLOSED); while the menu is open, also ZERO the state
-// the game (and ImGui's own backend) read so the player/camera don't move. The
-// captured snapshot is fed to ImGui nav in feed_input().
+// XInput gate: snapshot whichever controller is currently active, not just slot 0.
+// While the menu is open, ZERO the state the game (and ImGui's own backend) read
+// so the player/camera don't move. The captured snapshot is fed to ImGui nav in
+// feed_input().
 DWORD WINAPI hkXInputGetState(DWORD idx, XINPUT_STATE *st)
 {
     DWORD r = oXInputGetState(idx, st);
-    if (idx == 0)
+    if (r == ERROR_SUCCESS && st)
     {
-        if (r == ERROR_SUCCESS && st) { g_pad = st->Gamepad; g_pad_ok = true; }
-        else g_pad_ok = false;
+        if (!g_pad_ok || idx == g_pad_index || pad_has_activity(st->Gamepad))
+            set_active_gamepad(idx, st->Gamepad);
     }
+    else if (idx == g_pad_index)
+    {
+        g_pad_ok = false;
+    }
+
     if (st)
     {
         if (g_menu_open.load())
             ZeroMemory(&st->Gamepad, sizeof(st->Gamepad));
-        else if (idx == 0 && g_pad_swallow.load())
+        else if (idx < XUSER_MAX_COUNT && g_pad_swallow[idx].load())
         {
             // Suppress buttons held at close until they are released (no fall-through).
-            WORD sw = g_pad_swallow.load() & st->Gamepad.wButtons;
-            g_pad_swallow.store(sw);
+            WORD sw = g_pad_swallow[idx].load() & st->Gamepad.wButtons;
+            g_pad_swallow[idx].store(sw);
             st->Gamepad.wButtons &= ~sw;
         }
     }
@@ -936,28 +1110,45 @@ bool init_dx12(IDXGISwapChain3 *sc)
         ImGuiIO &io = ImGui::GetIO();
         io.IniFilename = nullptr; // don't drop an imgui.ini next to the game
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
-        // Load a system font WITH Cyrillic (the game/dump text can be Russian);
-        // the default ImGui font is ASCII-only and shows '?' for it.
+        // Load a system font with Cyrillic + the UI's Chinese glyphs. Prefer
+        // plain TTF files; TTC collections work on many systems, but keeping
+        // them as fallback avoids making the first overlay open depend on a
+        // collection parser path.
         {
-            const char *candidates[] = {"C:\\Windows\\Fonts\\segoeui.ttf",
+            static ImVector<ImWchar> ranges;
+            ImFontGlyphRangesBuilder builder;
+            builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
+            builder.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
+            builder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+            builder.AddText(goblin::i18n::font_glyph_seed_utf8());
+            builder.BuildRanges(&ranges);
+
+            const char *candidates[] = {"C:\\Windows\\Fonts\\simhei.ttf",
+                                        "C:\\Windows\\Fonts\\segoeui.ttf",
                                         "C:\\Windows\\Fonts\\arial.ttf",
-                                        "C:\\Windows\\Fonts\\tahoma.ttf"};
+                                        "C:\\Windows\\Fonts\\tahoma.ttf",
+                                        "C:\\Windows\\Fonts\\msyh.ttc",
+                                        "C:\\Windows\\Fonts\\msjh.ttc",
+                                        "C:\\Windows\\Fonts\\simsun.ttc"};
             bool loaded = false;
             for (const char *fp : candidates)
             {
                 if (GetFileAttributesA(fp) != INVALID_FILE_ATTRIBUTES)
                 {
-                    io.Fonts->AddFontFromFileTTF(fp, 18.0f, nullptr,
-                                                 io.Fonts->GetGlyphRangesCyrillic());
-                    loaded = true;
-                    spdlog::info("[OVERLAY] font: {} (Cyrillic)", fp);
-                    break;
+                    ImFont *font = io.Fonts->AddFontFromFileTTF(fp, 18.0f, nullptr, ranges.Data);
+                    if (font)
+                    {
+                        loaded = true;
+                        spdlog::info("[OVERLAY] font: {} (localized UI)", fp);
+                        break;
+                    }
+                    spdlog::warn("[OVERLAY] failed to load font: {}", fp);
                 }
             }
             if (!loaded)
             {
                 io.Fonts->AddFontDefault();
-                spdlog::warn("[OVERLAY] no system font found; Cyrillic will show as '?'");
+                spdlog::warn("[OVERLAY] no system font found; localized UI may show as '?'");
             }
         }
         apply_er_style();
@@ -1215,6 +1406,10 @@ HRESULT WINAPI hkPresent(IDXGISwapChain3 *sc, UINT sync, UINT flags)
     // global, so without this an Esc/F10 pressed in another app while alt-tabbed
     // would close/toggle our menu.
     const bool focused = game_focused();
+    if (focused)
+        refresh_gamepad_state();
+    if (!g_menu_open.load() && g_rebind_mode.load() != 0)
+        reset_rebind_state();
     const bool rebinding = g_rebind_mode.load() != 0;
     static bool prev_open_in = false;
     const int open_key = static_cast<int>(goblin::config::toggleInjectionKey); // F10
@@ -1249,7 +1444,8 @@ HRESULT WINAPI hkPresent(IDXGISwapChain3 *sc, UINT sync, UINT flags)
     {
         // Swallow whatever gamepad buttons are held right now (the close press,
         // e.g. B, or the toggle combo) until released, so it doesn't reach the game.
-        g_pad_swallow.store(g_pad_ok ? g_pad.wButtons : 0);
+        capture_swallow_buttons();
+        reset_rebind_state();
         goblin::save_config(goblin::g_ini_path);
     }
     prev_open = open_now;
