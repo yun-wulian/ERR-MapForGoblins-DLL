@@ -513,16 +513,31 @@ const char *goblin::i18n::entry_comment(const char *entry_key, const char *fallb
 
 const char *goblin::i18n::font_glyph_seed_utf8()
 {
-    return
-        "设置調試偵錯关于關於关闭關閉菜单選單热键快捷鍵显示顯示地图地圖图标圖示总开关總開關"
-        "所有类别類別全部开启開啟关闭關閉隐藏隱藏重新打开開啟世界变化變更导出匯出标记標記复制複製"
-        "字符字元版本源码原始碼支持支援方向键方向鍵摇杆搖桿点击點擊空格空白鍵标签分頁"
-        "基础基礎装备裝備关键道具關鍵道具战利品戰利品魔法祷告禱告任务任務兼容性相容性"
-        "加载載入延迟延遲需要碎片加快武器防具战灰戰灰骨灰护符護符星星泪滴淚滴制作製作笔记筆記"
-        "结晶露滴結晶露滴大卢恩盧恩魔石剑钥匙劍鑰匙幼体幼體失力壶調香瓶幽影树樹种子種子灵灰靈灰"
-        "砥石刀箭矢弩箭铃珠鈴珠商人消耗品油脂实用實用属性屬性能力强化強化材料铃兰鈴蘭采集採集"
-        "多人联机連線唤声泥颅喚聲泥顱拉达果实拉達果實肢体動作重复重複锻造石鍛造石古龙龍心脏臟"
-        "记忆石記憶石卷轴卷軸死根进度進度温床诅咒詛咒余火餘火饰品飾品赐福賜福敌对敵對小恶魔惡魔"
-        "雕像绘画繪畫灵魂氣流玛莉卡瑪莉卡楔石召唤池召喚池互动互動物件野外地下城入口营地營地"
-        "实时即時拾取旗标旗標名称名稱匿名模式自动自動简体中文簡體中文繁體中文无法识别無法辨識英文";
+    static std::string seed;
+    if (!seed.empty())
+        return seed.c_str();
+
+    auto add = [](const char *text) {
+        if (text && text[0])
+            seed += text;
+    };
+    auto add_name_rows = [&](const auto &rows) {
+        for (const auto &row : rows)
+        {
+            add(row.sc);
+            add(row.tc);
+        }
+    };
+
+    for (const auto &row : TEXTS)
+    {
+        add(row.sc);
+        add(row.tc);
+    }
+    add_name_rows(SECTION_LABELS);
+    add_name_rows(SECTION_COMMENTS);
+    add_name_rows(ENTRY_LABELS);
+    add_name_rows(ENTRY_COMMENTS);
+
+    return seed.c_str();
 }
